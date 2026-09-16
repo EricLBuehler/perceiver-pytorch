@@ -1,13 +1,13 @@
 from __future__ import annotations
 from math import pi, log
-from functools import wraps
+from functools import wraps, partial
 
 import torch
-from torch import nn, einsum, stack, cat
-from torch.nn import Module, ModuleList
+from torch import nn, stack, cat, Tensor, is_tensor
+from torch.nn import Module, ModuleList, Linear
 import torch.nn.functional as F
 
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 from einops.layers.torch import Reduce
 
 # helpers
@@ -46,6 +46,10 @@ def fourier_encode(x, max_freq, num_bands = 4):
     x = cat([x.sin(), x.cos()], dim = -1)
     x = cat((x, orig_x), dim = -1)
     return x
+
+# constants
+
+LinearNoBias = partial(Linear, bias = False)
 
 # helper classes
 
@@ -108,7 +112,7 @@ class Attention(nn.Module):
 
         q, k, v = (rearrange(t, 'b n (h d) -> (b h) n d', h = h) for t in (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        sim = einsum(q, k, 'b i d, b j d -> b i j') * self.scale
 
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
@@ -132,9 +136,38 @@ class Attention(nn.Module):
 
         # aggregate
 
-        out = einsum('b i j, b j d -> b i d', attn, v)
+        out = einsum(attn, v, 'b i j, b j d -> b i d')
         out = rearrange(out, '(b h) n d -> b n (h d)', h = h)
         return self.to_out(out)
+
+# enformer attention residual
+# attention residuals proposed by Guangyu (Nathan) Chen et al. with Kimi team (https://arxiv.org/abs/2603.15031)
+# using the attention pool designed by Žiga Avsec et al. in Enformer (https://www.nature.com/articles/s41592-021-01252-x)
+
+class EnformerAttentionResidual(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        rank = 64
+    ):
+        super().__init__()
+        self.to_attn_logits = nn.Sequential(
+            LinearNoBias(dim, rank),
+            LinearNoBias(rank, dim)
+        )
+
+    def forward(
+        self,
+        block_outputs: list[Tensor] | Tensor
+    ):
+        block_outputs = list(block_outputs)
+        past_layers = rearrange(block_outputs, 'l b n d -> b n l d')
+
+        logits = self.to_attn_logits(past_layers)
+        attn = logits.softmax(dim = -2)
+
+        return einsum(past_layers, attn, 'b n l d, b n l d -> b n d')
 
 # main class
 
@@ -160,7 +193,9 @@ class Perceiver(nn.Module):
         fourier_encode_data = True,
         self_per_cross_attn = 1,
         final_classifier_head = True,
-        inverted_cross_attn: bool | tuple[bool, ...] = False
+        inverted_cross_attn: bool | tuple[bool, ...] = False,
+        attn_residual = False,
+        attn_residual_rank = 64
     ):
         """The shape of the final attention mechanism will be:
         depth * (cross attention -> self_per_cross_attn * self attention)
@@ -195,6 +230,8 @@ class Perceiver(nn.Module):
         self.max_freq = max_freq
         self.num_freq_bands = num_freq_bands
 
+        self.has_attn_residual = attn_residual
+
         # inverted attention
         # slot attention: https://arxiv.org/abs/2006.15055
         # inverted attention: https://openreview.net/forum?id=3H8j14mA3X
@@ -217,8 +254,9 @@ class Perceiver(nn.Module):
         get_cross_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim, dropout = ff_dropout))
         get_latent_attn = lambda: PreNorm(latent_dim, Attention(latent_dim, heads = latent_heads, dim_head = latent_dim_head, dropout = attn_dropout))
         get_latent_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim, dropout = ff_dropout))
+        get_attn_residual = lambda: (EnformerAttentionResidual(latent_dim, rank = attn_residual_rank) if attn_residual else None)
 
-        get_cross_attn, get_cross_ff, get_latent_attn, get_latent_ff = (cache_fn(fn) for fn in (get_cross_attn, get_cross_ff, get_latent_attn, get_latent_ff))
+        get_cross_attn, get_cross_ff, get_latent_attn, get_latent_ff, get_attn_residual = (cache_fn(fn) for fn in (get_cross_attn, get_cross_ff, get_latent_attn, get_latent_ff, get_attn_residual))
 
         self.layers = ModuleList([])
         for i in range(depth):
@@ -236,7 +274,8 @@ class Perceiver(nn.Module):
             self.layers.append(ModuleList([
                 get_cross_attn(**cache_args),
                 get_cross_ff(**cache_args),
-                self_attns
+                self_attns,
+                get_attn_residual(**cache_args)
             ]))
 
         self.to_logits = nn.Sequential(
@@ -249,7 +288,9 @@ class Perceiver(nn.Module):
         self,
         data,
         mask = None,
-        return_embeddings = False
+        return_embeddings = False,
+        block_outputs: list[Tensor] | None = None,
+        return_hiddens = False
     ):
         b, *axis, _, device, dtype = *data.shape, data.device, data.dtype
         assert len(axis) == self.input_axis, 'input data must have the right number of axis'
@@ -271,9 +312,16 @@ class Perceiver(nn.Module):
 
         x = repeat(self.latents, 'n d -> b n d', b = b)
 
+        # keep the hidden states only if they are needed for the attention residual, or explicitly requested
+
+        keep_hiddens = return_hiddens or self.has_attn_residual or exists(block_outputs)
+
+        if keep_hiddens:
+            block_outputs = [block_outputs] if is_tensor(block_outputs) else list(default(block_outputs, [x]))
+
         # layers
 
-        for i, (cross_attn, cross_ff, self_attns) in enumerate(self.layers):
+        for i, (cross_attn, cross_ff, self_attns, attn_residual) in enumerate(self.layers):
             x = cross_attn(x, context = data, mask = mask, inverted_attention = self.inverted_cross_attn[i]) + x
             x = cross_ff(x) + x
 
@@ -281,11 +329,21 @@ class Perceiver(nn.Module):
                 x = self_attn(x) + x
                 x = self_ff(x) + x
 
+            # keep the hidden states for the attention residual
+
+            if keep_hiddens:
+                block_outputs.append(x)
+
+            # attention residual
+
+            if exists(attn_residual):
+                x = attn_residual(block_outputs)
+
         # allow for fetching embeddings
 
-        if return_embeddings:
-            return x
+        out = x if return_embeddings else self.to_logits(x)
 
-        # to logits
+        if not return_hiddens:
+            return out
 
-        return self.to_logits(x)
+        return out, block_outputs

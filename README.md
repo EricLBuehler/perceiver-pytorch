@@ -140,3 +140,23 @@ from perceiver_pytorch.experimental import Perceiver
     url     = {https://openreview.net/forum?id=WgQZNoQ5AB}
 }
 ```
+
+```bibtex
+@article{chen2026attention,
+    title   = {Attention Residuals},
+    author  = {Guangyu Chen and Yu Zhang and Jianlin Su and Weixin Xu and Siyuan Pan and Yaoyu Wang and Yucheng Wang and Guanduo Chen and Bohong Yin and Yutian Chen and Junjie Yan and Ming Wei and Y. Zhang and Fanqing Meng and Chao Hong and Xiaotong Xie and Shaowei Liu and Enzhe Lu and Yunpeng Tai and Yanru Chen and Xin Men and Haiqing Guo and Y. Charles and Haoyu Lu and Lin Sui and Jinguo Zhu and Zaida Zhou and Weiran He and Weixiao Huang and Xinran Xu and Yuzhi Wang and Guokun Lai and Yulun Du and Yuxin Wu and Zhilin Yang and Xinyu Zhou},
+    journal = {arXiv preprint arXiv:2603.15031},
+    year    = {2026}
+}
+```
+
+```bibtex
+@article{avsec2021effective,
+    title   = {Effective gene expression prediction from sequence by integrating long-range interactions},
+    author  = {{\v{Z}}iga Avsec and Vikram Agarwal and Daniel Visentin and Joseph R. Ledsam and Agnieszka Grabska-Barwi{\'n}ska and Kyle R. Taylor and Yannis Assael and John Jumper and Pushmeet Kohli and David R. Kelley},
+    journal = {Nature Methods},
+    volume  = {18},
+    pages   = {1196--1203},
+    year    = {2021}
+}
+```

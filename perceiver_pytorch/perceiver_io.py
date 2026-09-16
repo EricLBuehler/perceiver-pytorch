@@ -1,8 +1,9 @@
+from __future__ import annotations
 from math import pi, log
-from functools import wraps
+from functools import wraps, partial
 
 import torch
-from torch import nn, einsum
+from torch import nn, einsum, Tensor, is_tensor
 import torch.nn.functional as F
 
 from einops import rearrange, repeat
@@ -14,6 +15,13 @@ def exists(val):
 
 def default(val, d):
     return val if exists(val) else d
+
+def l1norm(t, dim = -1, eps = 1e-8):
+    return F.normalize(t, p = 1, dim = dim, eps = eps)
+
+# constants
+
+LinearNoBias = partial(nn.Linear, bias = False)
 
 def cache_fn(f):
     cache = None
@@ -103,7 +111,7 @@ class Attention(nn.Module):
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias = False)
         self.to_out = nn.Linear(inner_dim, query_dim)
 
-    def forward(self, x, context = None, mask = None):
+    def forward(self, x, context = None, mask = None, inverted_attention = False):
         h = self.heads
 
         q = self.to_q(x)
@@ -121,11 +129,49 @@ class Attention(nn.Module):
             sim.masked_fill_(~mask, max_neg_value)
 
         # attention, what we cannot get enough of
-        attn = sim.softmax(dim = -1)
+
+        if inverted_attention:
+            attn = sim.softmax(dim = -2)
+
+            if exists(mask):
+                attn = attn.masked_fill(~mask, 0.)
+
+            attn = l1norm(attn)
+        else:
+            attn = sim.softmax(dim = -1)
 
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h = h)
         return self.to_out(out)
+
+# enformer attention residual
+# attention residuals proposed by Guangyu (Nathan) Chen et al. with Kimi team (https://arxiv.org/abs/2603.15031)
+# using the attention pool designed by Žiga Avsec et al. in Enformer (https://www.nature.com/articles/s41592-021-01252-x)
+
+class EnformerAttentionResidual(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        rank = 64
+    ):
+        super().__init__()
+        self.to_attn_logits = nn.Sequential(
+            LinearNoBias(dim, rank),
+            LinearNoBias(rank, dim)
+        )
+
+    def forward(
+        self,
+        block_outputs: list[Tensor] | Tensor
+    ):
+        block_outputs = list(block_outputs)
+        past_layers = rearrange(block_outputs, 'l b n d -> b n l d')
+
+        logits = self.to_attn_logits(past_layers)
+        attn = logits.softmax(dim = -2)
+
+        return einsum('b n l d, b n l d -> b n d', past_layers, attn)
 
 # main class
 
@@ -145,7 +191,10 @@ class PerceiverIO(nn.Module):
         latent_dim_head = 64,
         weight_tie_layers = False,
         decoder_ff = False,
-        seq_dropout_prob = 0.
+        seq_dropout_prob = 0.,
+        attn_residual = False,
+        attn_residual_rank = 64,
+        inverted_cross_attn = False
     ):
         super().__init__()
         self.seq_dropout_prob = seq_dropout_prob
@@ -157,9 +206,14 @@ class PerceiverIO(nn.Module):
             PreNorm(latent_dim, FeedForward(latent_dim))
         ])
 
+        self.has_attn_residual = attn_residual
+        self.inverted_cross_attn = inverted_cross_attn
+
         get_latent_attn = lambda: PreNorm(latent_dim, Attention(latent_dim, heads = latent_heads, dim_head = latent_dim_head))
         get_latent_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim))
-        get_latent_attn, get_latent_ff = map(cache_fn, (get_latent_attn, get_latent_ff))
+        get_attn_residual = lambda: (EnformerAttentionResidual(latent_dim, rank = attn_residual_rank) if attn_residual else None)
+
+        get_latent_attn, get_latent_ff, get_attn_residual = map(cache_fn, (get_latent_attn, get_latent_ff, get_attn_residual))
 
         self.layers = nn.ModuleList([])
         cache_args = {'_cache': weight_tie_layers}
@@ -167,7 +221,8 @@ class PerceiverIO(nn.Module):
         for i in range(depth):
             self.layers.append(nn.ModuleList([
                 get_latent_attn(**cache_args),
-                get_latent_ff(**cache_args)
+                get_latent_ff(**cache_args),
+                get_attn_residual(**cache_args)
             ]))
 
         self.decoder_cross_attn = PreNorm(queries_dim, Attention(queries_dim, latent_dim, heads = cross_heads, dim_head = cross_dim_head), context_dim = latent_dim)
@@ -179,7 +234,9 @@ class PerceiverIO(nn.Module):
         self,
         data,
         mask = None,
-        queries = None
+        queries = None,
+        block_outputs: list[Tensor] | None = None,
+        return_hiddens = False
     ):
         b, *_, device = *data.shape, data.device
 
@@ -194,17 +251,33 @@ class PerceiverIO(nn.Module):
 
         # cross attention only happens once for Perceiver IO
 
-        x = cross_attn(x, context = data, mask = mask) + x
+        x = cross_attn(x, context = data, mask = mask, inverted_attention = self.inverted_cross_attn) + x
         x = cross_ff(x) + x
+
+        # keep the hidden states only if they are needed for the attention residual, or explicitly requested
+
+        keep_hiddens = return_hiddens or self.has_attn_residual or exists(block_outputs)
+
+        if keep_hiddens:
+            block_outputs = [block_outputs] if is_tensor(block_outputs) else list(default(block_outputs, [x]))
 
         # layers
 
-        for self_attn, self_ff in self.layers:
+        for self_attn, self_ff, attn_residual in self.layers:
             x = self_attn(x) + x
             x = self_ff(x) + x
 
+            if keep_hiddens:
+                block_outputs.append(x)
+
+            if exists(attn_residual):
+                x = attn_residual(block_outputs)
+
         if not exists(queries):
-            return x
+            if not return_hiddens:
+                return x
+
+            return x, block_outputs
 
         # make sure queries contains batch dimension
 
@@ -222,7 +295,12 @@ class PerceiverIO(nn.Module):
 
         # final linear out
 
-        return self.to_logits(latents)
+        out = self.to_logits(latents)
+
+        if not return_hiddens:
+            return out
+
+        return out, block_outputs
 
 # Perceiver LM example
 
