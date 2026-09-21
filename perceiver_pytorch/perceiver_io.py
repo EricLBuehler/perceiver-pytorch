@@ -157,6 +157,7 @@ class EnformerAttentionResidual(nn.Module):
     ):
         super().__init__()
         self.to_attn_logits = nn.Sequential(
+            nn.RMSNorm(dim),
             LinearNoBias(dim, rank),
             LinearNoBias(rank, dim)
         )
